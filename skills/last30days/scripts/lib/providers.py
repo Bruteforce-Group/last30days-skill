@@ -120,6 +120,95 @@ class ReasoningClient:
 
     name: str
 
+    def __init__(self) -> None:
+        self._usage_calls = 0
+        self._usage_prompt_tokens = 0
+        self._usage_completion_tokens = 0
+        self._usage_complete = True
+
+    @staticmethod
+    def _valid_token_count(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    def record_usage(
+        self,
+        prompt_tokens: Any,
+        completion_tokens: Any,
+        total_tokens: Any = None,
+    ) -> None:
+        self._usage_calls += 1
+        if not self._valid_token_count(prompt_tokens):
+            self._usage_complete = False
+            return
+        if total_tokens is not None:
+            if (
+                not self._valid_token_count(total_tokens)
+                or total_tokens < prompt_tokens
+                or (
+                    completion_tokens is not None
+                    and (
+                        not self._valid_token_count(completion_tokens)
+                        or total_tokens < prompt_tokens + completion_tokens
+                    )
+                )
+            ):
+                self._usage_complete = False
+                return
+            # Reported totals can include reasoning tokens absent from completion counts.
+            completion_tokens = total_tokens - prompt_tokens
+        elif not self._valid_token_count(completion_tokens):
+            self._usage_complete = False
+            return
+        self._usage_prompt_tokens += prompt_tokens
+        self._usage_completion_tokens += completion_tokens
+
+    @property
+    def total_usage(self) -> dict[str, int] | None:
+        if not self._usage_calls or not self._usage_complete:
+            return None
+        return {
+            "calls": self._usage_calls,
+            "promptTokens": self._usage_prompt_tokens,
+            "completionTokens": self._usage_completion_tokens,
+            "totalTokens": self._usage_prompt_tokens + self._usage_completion_tokens,
+        }
+
+    def _mark_usage_incomplete(self) -> None:
+        self._usage_complete = False
+
+    def _post(self, url: str, payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        try:
+            return http.post(url, payload, on_retry=self._mark_usage_incomplete, **kwargs)
+        except Exception:
+            self._mark_usage_incomplete()
+            raise
+
+    def _record_response_usage(
+        self,
+        response: dict[str, Any],
+        *,
+        metadata_key: str,
+        prompt_key: str,
+        completion_key: str,
+        total_key: str,
+        prompt_fallback_key: str | None = None,
+        completion_fallback_key: str | None = None,
+    ) -> None:
+        usage = response.get(metadata_key)
+        if not isinstance(usage, dict):
+            usage = {}
+        prompt_tokens = usage.get(prompt_key)
+        completion_tokens = usage.get(completion_key)
+        if prompt_tokens is None and prompt_fallback_key:
+            prompt_tokens = usage.get(prompt_fallback_key)
+        if completion_tokens is None and completion_fallback_key:
+            completion_tokens = usage.get(completion_fallback_key)
+        self.record_usage(
+            prompt_tokens,
+            completion_tokens,
+            usage.get(total_key),
+        )
+
     def generate_text(
         self,
         model: str,
@@ -145,6 +234,7 @@ class GeminiClient(ReasoningClient):
     name = "gemini"
 
     def __init__(self, api_key: str):
+        super().__init__()
         self.api_key = api_key
 
     def _generate_content(
@@ -163,7 +253,7 @@ class GeminiClient(ReasoningClient):
             body["generationConfig"]["responseMimeType"] = response_mime_type
         if tools:
             body["tools"] = tools
-        return http.post(
+        return self._post(
             GEMINI_URL.format(model=model, api_key=self.api_key),
             body,
             headers={"Content-Type": "application/json"},
@@ -184,12 +274,20 @@ class GeminiClient(ReasoningClient):
             tools=tools,
             response_mime_type=response_mime_type,
         )
+        self._record_response_usage(
+            payload,
+            metadata_key="usageMetadata",
+            prompt_key="promptTokenCount",
+            completion_key="candidatesTokenCount",
+            total_key="totalTokenCount",
+        )
         return extract_gemini_text(payload)
 
 class OpenAIClient(ReasoningClient):
     name = "openai"
 
     def __init__(self, token: str):
+        super().__init__()
         self.token = token
 
     def generate_text(
@@ -208,7 +306,7 @@ class OpenAIClient(ReasoningClient):
             "temperature": 0,
         }
         endpoint = resolve_endpoint("OPENAI_BASE_URL", OPENAI_RESPONSES_URL)
-        response = http.post(
+        response = self._post(
             endpoint,
             payload,
             headers={
@@ -218,6 +316,13 @@ class OpenAIClient(ReasoningClient):
             timeout=90,
             bypass_proxy=is_loopback_http_endpoint(endpoint),
         )
+        self._record_response_usage(
+            response,
+            metadata_key="usage",
+            prompt_key="input_tokens",
+            completion_key="output_tokens",
+            total_key="total_tokens",
+        )
         return extract_openai_text(response)
 
 
@@ -225,6 +330,7 @@ class XAIClient(ReasoningClient):
     name = "xai"
 
     def __init__(self, api_key: str):
+        super().__init__()
         self.api_key = api_key
 
     def generate_text(
@@ -241,7 +347,7 @@ class XAIClient(ReasoningClient):
             "input": [{"role": "user", "content": prompt}],
         }
         endpoint = resolve_endpoint("XAI_BASE_URL", XAI_RESPONSES_URL)
-        response = http.post(
+        response = self._post(
             endpoint,
             payload,
             headers={
@@ -251,6 +357,15 @@ class XAIClient(ReasoningClient):
             timeout=90,
             bypass_proxy=is_loopback_http_endpoint(endpoint),
         )
+        self._record_response_usage(
+            response,
+            metadata_key="usage",
+            prompt_key="input_tokens",
+            completion_key="output_tokens",
+            total_key="total_tokens",
+            prompt_fallback_key="prompt_tokens",
+            completion_fallback_key="completion_tokens",
+        )
         return extract_openai_text(response)
 
 
@@ -258,6 +373,7 @@ class OpenRouterClient(ReasoningClient):
     name = "openrouter"
 
     def __init__(self, api_key: str):
+        super().__init__()
         self.api_key = api_key
 
     def generate_text(
@@ -275,7 +391,7 @@ class OpenRouterClient(ReasoningClient):
             "temperature": 0,
         }
         endpoint = resolve_endpoint("OPENROUTER_BASE_URL", OPENROUTER_URL)
-        response = http.post(
+        response = self._post(
             endpoint,
             payload,
             headers={
@@ -284,6 +400,13 @@ class OpenRouterClient(ReasoningClient):
             },
             timeout=90,
             bypass_proxy=is_loopback_http_endpoint(endpoint),
+        )
+        self._record_response_usage(
+            response,
+            metadata_key="usage",
+            prompt_key="prompt_tokens",
+            completion_key="completion_tokens",
+            total_key="total_tokens",
         )
         return extract_openai_text(response)
 

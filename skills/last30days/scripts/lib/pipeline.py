@@ -3131,6 +3131,7 @@ def run(
     )
     if library_warning:
         warnings.append(library_warning)
+    bundle.artifacts["usage"] = reasoning_provider.total_usage if reasoning_provider else None
 
     return schema.Report(
         topic=topic,
